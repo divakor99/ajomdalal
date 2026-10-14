@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
-from .conv import Conv, DCNv3, DWConv, GhostConv, LightConv, RepConv, SimAM, autopad
+from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, SimAM, autopad
 from .transformer import TransformerBlock
 
 __all__ = (
@@ -29,6 +29,7 @@ __all__ = (
     "ADown",
     "Attention",
     "BNContrastiveHead",
+    "BiFPN",
     "Bottleneck",
     "BottleneckCSP",
     "C2f",
@@ -41,6 +42,7 @@ __all__ = (
     "CBFuse",
     "CBLinear",
     "ContrastiveHead",
+    "DCNv3Fast",
     "GhostBottleneck",
     "HGBlock",
     "HGStem",
@@ -50,8 +52,6 @@ __all__ = (
     "RepNCSPELAN4",
     "RepVGGDW",
     "ResNetLayer",
-    "BiFPN",
-    "DCNv3Fast",
     "SCDown",
     "TorchVision",
 )
@@ -2084,8 +2084,7 @@ class BiFPNNode(nn.Module):
         self.w = nn.Parameter(torch.ones(self.n, dtype=torch.float32), requires_grad=True)
         self.eps = 1e-4
         self.projs = nn.ModuleList(
-            Conv(c, out_channels, k=1) if c != out_channels else nn.Identity()
-            for c in in_channels
+            Conv(c, out_channels, k=1) if c != out_channels else nn.Identity() for c in in_channels
         )
         self.dw = DWConv(out_channels, out_channels, k=5, s=1)
         self.pw = Conv(out_channels, out_channels, k=1)
@@ -2101,9 +2100,8 @@ class BiFPNNode(nn.Module):
 class DCNv3Fast(nn.Module):
     """Vectorised DCNv3-style deformable convolution — no Python for-loops.
 
-    Replaces the original per-kernel-point for-loop with a single batched
-    grid_sample call, giving proper gradient flow through the offset prediction
-    branch.
+    Replaces the original per-kernel-point for-loop with a single batched grid_sample call, giving proper gradient flow
+    through the offset prediction branch.
 
     Args:
         c1 (int): Input channels.
@@ -2154,7 +2152,7 @@ class DCNv3Fast(nn.Module):
         Ho, Wo = om.shape[2], om.shape[3]
         om = om.view(B, self.g, self.k2, 3, Ho, Wo)
         offsets = om[..., :2, :, :]
-        masks   = torch.sigmoid(om[..., 2, :, :])
+        masks = torch.sigmoid(om[..., 2, :, :])
 
         # 2. Build sampling grid
         bx = self.base_grid[..., 0] / (W / 2) * self.s
@@ -2182,10 +2180,13 @@ class DCNv3Fast(nn.Module):
         v_rep = v_grouped.unsqueeze(1).expand(-1, self.k2, -1, -1, -1)
         v_rep = v_rep.reshape(B * self.g * self.k2, c_per_g, H, W)
 
-        grid_xy = torch.stack([
-            sx_flat.reshape(B * self.g * self.k2, Ho, Wo),
-            sy_flat.reshape(B * self.g * self.k2, Ho, Wo),
-        ], dim=-1)
+        grid_xy = torch.stack(
+            [
+                sx_flat.reshape(B * self.g * self.k2, Ho, Wo),
+                sy_flat.reshape(B * self.g * self.k2, Ho, Wo),
+            ],
+            dim=-1,
+        )
 
         sampled = torch.nn.functional.grid_sample(
             v_rep, grid_xy, mode="bilinear", padding_mode="zeros", align_corners=True
@@ -2207,9 +2208,9 @@ class BiFPN(nn.Module):
         in_channels (list[int]): [P2_ch, P3_ch, P4_ch, P5_ch] from backbone.
         out_channels (int): Unified feature width (384 in yolo26-wafer train-10+).
         num_iters (int): BiFPN iterations (default 3).
-        use_p2_dcn (bool): Apply DCNv3Fast on the P2 (stride-4) top-down output. Default True.
-            False reproduces the earlier layout without `dcn_p2` (no `dcn_p2.*` keys in the
-            state dict), which is what the train-10 checkpoint was actually trained with.
+        use_p2_dcn (bool): Apply DCNv3Fast on the P2 (stride-4) top-down output. Default True. False reproduces the
+            earlier layout without `dcn_p2` (no `dcn_p2.*` keys in the state dict), which is what the train-10
+            checkpoint was actually trained with.
     """
 
     def __init__(self, in_channels: list, out_channels: int, num_iters: int = 3, use_p2_dcn: bool = True):
@@ -2219,10 +2220,7 @@ class BiFPN(nn.Module):
         self.use_p2_dcn = bool(use_p2_dcn)
         oc = out_channels
 
-        self.input_proj = nn.ModuleList(
-            Conv(c, oc, k=1) if c != oc else nn.Identity()
-            for c in in_channels
-        )
+        self.input_proj = nn.ModuleList(Conv(c, oc, k=1) if c != oc else nn.Identity() for c in in_channels)
 
         # DCNv3Fast on P3/P4 always; on P2 only when use_p2_dcn. P5 is pure semantics.
         if self.use_p2_dcn:
@@ -2235,16 +2233,24 @@ class BiFPN(nn.Module):
         self.td_nodes = nn.ModuleList()
         self.bu_nodes = nn.ModuleList()
         for _ in range(num_iters):
-            self.td_nodes.append(nn.ModuleList([
-                BiFPNNode([oc, oc], oc),       # P4_td: P4 + up(P5)
-                BiFPNNode([oc, oc], oc),       # P3_td: P3 + up(P4_td)
-                BiFPNNode([oc, oc], oc),       # P2_td: P2 + up(P3_td)
-            ]))
-            self.bu_nodes.append(nn.ModuleList([
-                BiFPNNode([oc, oc, oc], oc),   # P3_out
-                BiFPNNode([oc, oc, oc], oc),   # P4_out
-                BiFPNNode([oc, oc], oc),        # P5_out
-            ]))
+            self.td_nodes.append(
+                nn.ModuleList(
+                    [
+                        BiFPNNode([oc, oc], oc),  # P4_td: P4 + up(P5)
+                        BiFPNNode([oc, oc], oc),  # P3_td: P3 + up(P4_td)
+                        BiFPNNode([oc, oc], oc),  # P2_td: P2 + up(P3_td)
+                    ]
+                )
+            )
+            self.bu_nodes.append(
+                nn.ModuleList(
+                    [
+                        BiFPNNode([oc, oc, oc], oc),  # P3_out
+                        BiFPNNode([oc, oc, oc], oc),  # P4_out
+                        BiFPNNode([oc, oc], oc),  # P5_out
+                    ]
+                )
+            )
 
         self.upsample = nn.Upsample(scale_factor=2, mode="nearest")
         self.downsample_bu = nn.ModuleList([Conv(oc, oc, k=3, s=2) for _ in range(num_iters * 2)])
